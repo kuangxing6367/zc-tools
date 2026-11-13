@@ -1,0 +1,46 @@
+# ---- 构建产物 / Build output ----
+dist/
+_build/
+build/
+Output/
+*.zip
+*.7z
+*.exe
+*.msi
+
+# 本地下载的 Python 免安装运行时（几十 MB，不入库）
+python-embed*/
+runtime/
+python.exe
+pythonw.exe
+python37.dll
+vcruntime140.dll
+*._pth
+
+# ---- 运行时生成 / Runtime artifacts ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 日志与轮转备份
+*.log
+*.log.[0-9]*
+service.log*
+sync.log*
+
+# 服务/程序配置（不同机器路径不同，不该入库）
+service.ini
+tray_mon.json
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地测试临时目录 ----
+_test/tmp/
+_test/out/
