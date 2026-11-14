@@ -1,38 +1,42 @@
-# ---- 构建产物 / Build output ----
-dist/
-_build/
-build/
-Output/
-*.zip
-*.7z
-*.exe
-*.msi
+# ==========================================================
+# 注意：根目录下的 *.exe / *.zip 是**要入库的最终产物**，
+# 所以这里故意不写全局的 *.exe、*.zip 忽略规则。
+# 只在 src/ 下面拦构建中间件和解包出来的运行时。
+# ==========================================================
 
-# 本地下载的 Python 免安装运行时（几十 MB，不入库）
-python-embed*/
-runtime/
-python.exe
-pythonw.exe
-python37.dll
-vcruntime140.dll
-*._pth
+# ---- 源码目录里的构建中间件 / 解包出来的运行时 ----
+src/**/dist/
+src/**/_build/
+src/**/build/
+src/**/Output/
+src/**/setup_out/
+src/**/python-embed*/
+src/**/runtime/
+src/**/*._pth
+src/**/*.pyd
+src/**/python37.dll
+src/**/python3.dll
+src/**/vcruntime140.dll
+src/**/python37.zip
+src/**/python.exe
+src/**/pythonw.exe
 
-# ---- 运行时生成 / Runtime artifacts ----
+# ---- Python 字节码 ----
 __pycache__/
 *.py[cod]
 *$py.class
 
-# 日志与轮转备份
+# ---- 运行时生成：日志与轮转备份 ----
 *.log
 *.log.[0-9]*
 service.log*
 sync.log*
 
-# 服务/程序配置（不同机器路径不同，不该入库）
+# ---- 运行时配置（每台机器路径不同，不该入库）----
 service.ini
 tray_mon.json
 
-# ---- 编辑器 / 系统 ----
+# ---- 编辑器 / 系统垃圾 ----
 .vscode/
 .idea/
 *.swp
@@ -44,3 +48,4 @@ desktop.ini
 # ---- 本地测试临时目录 ----
 _test/tmp/
 _test/out/
+_test/extract/
