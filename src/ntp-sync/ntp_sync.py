@@ -42,7 +42,7 @@ import urllib.request
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 IS_WINDOWS = (os.name == 'nt')
 
 # 日志轮转默认值：单文件 1 MiB，保留 5 个历史文件，最多占用约 6 MiB。

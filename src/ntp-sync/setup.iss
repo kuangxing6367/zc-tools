@@ -3,7 +3,7 @@
 ; Target: Windows 7 SP1 and later, 32-bit (runs on x64 via WOW64)
 
 #define AppName "NTP Time Sync"
-#define AppVersion "1.2.0"
+#define AppVersion "1.3.0"
 #define AppPublisher "zc team"
 
 [Setup]

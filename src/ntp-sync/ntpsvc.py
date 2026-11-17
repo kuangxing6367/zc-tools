@@ -4,8 +4,13 @@
 ntpsvc.py - 纯 ctypes 的 Windows 服务宿主，把 ntp_sync 装成开机自启服务。
 
 零第三方依赖：不需要 pywin32、NSSM、srvany，只用标准库 + advapi32。
-服务以 LocalSystem 运行，在用户登录之前（尚未进入桌面时）就开始对时；
-网络未就绪时按 15s->300s 退避重试，之后按 interval 周期校准。
+服务以 LocalSystem 运行，在用户登录之前（尚未进入桌面时）就开始对时。
+
+两套回退策略，专门对付「网络服务比时间服务晚启动 / 开机压根没网」：
+  1. 启动阶段还没成功过时，失败后每 5 秒重试一次，最多 60 次（共 5 分钟）；
+  2. 全程监听网络状态，一旦从「无网」变「有网」（或上次同步失败后网络可用），
+     立即补一次同步，不用干等 interval（默认 30 分钟）到点。
+启动重试耗尽后转入 interval 周期模式，但网络监听不会关。
 
 子命令：
   install [--interval 1800]   注册为自动启动服务并立即启动（需管理员）
@@ -21,6 +26,7 @@ import ctypes
 import io
 import logging
 import os
+import socket
 import sys
 import threading
 import time
@@ -58,6 +64,13 @@ PYTHON_EXE = os.path.join(BASE_DIR, 'python.exe')
 SELF_PY = os.path.join(BASE_DIR, 'ntpsvc.py')
 
 DEFAULT_INTERVAL = 1800
+# 开机阶段：网络常常比服务晚起来，失败后密集重试 5s x 60 = 5 分钟。
+DEFAULT_BOOT_RETRY_INTERVAL = 5.0
+DEFAULT_BOOT_RETRY_LIMIT = 60
+# 网络监听：每 3 秒探一次；恢复后 30 秒内不重复触发，防止网络抖动刷屏。
+DEFAULT_NET_CHECK_INTERVAL = 3.0
+NET_RECOVERY_COOLDOWN = 30.0
+
 # 服务日志轮转：1 MiB x 5 份历史 + 当前文件，最坏占用约 6 MiB。
 # 30 分钟一行，1 MiB 能存半年以上，不必担心无人值守的机器把盘写满。
 DEFAULT_LOG_MAX_BYTES = ntp_sync.DEFAULT_LOG_MAX_BYTES
@@ -151,6 +164,71 @@ def _handler(control):
 
 
 # ---------------------------------------------------------------------------
+# 网络可用性探测
+# ---------------------------------------------------------------------------
+# InternetGetConnectedState 只能说明「有链路」，不能说明 DNS/外网可用；
+# 开机时网卡往往已经 up 但 DHCP/DNS 还没好，所以再叠一层 DNS 解析。
+# 解析放进守护线程，避免 DNS 卡住时阻塞服务停止。
+_wininet = None
+if sys.platform == 'win32':
+    try:
+        _wininet = ctypes.WinDLL('wininet', use_last_error=True)
+        _wininet.InternetGetConnectedState.argtypes = [
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        _wininet.InternetGetConnectedState.restype = wintypes.BOOL
+    except Exception:
+        _wininet = None
+
+_net_probe_lock = threading.Lock()
+_net_probe_busy = False
+
+
+def _dns_reachable(host, timeout=2.0):
+    """DNS 解析探测。返回 True / False / None（上次还在跑，本次不确定）。"""
+    global _net_probe_busy
+    with _net_probe_lock:
+        if _net_probe_busy:
+            return None
+        _net_probe_busy = True
+    box = []
+
+    def probe():
+        global _net_probe_busy
+        try:
+            socket.getaddrinfo(host, 123, 0, socket.SOCK_DGRAM)
+            box.append(True)
+        except Exception:
+            box.append(False)
+        finally:
+            with _net_probe_lock:
+                _net_probe_busy = False
+
+    t = threading.Thread(target=probe, name='ntp-net-probe')
+    t.daemon = True
+    t.start()
+    t.join(timeout)
+    return box[0] if box else None
+
+
+def network_ready(cfg=None):
+    """返回 True（有网）/ False（无网）/ None（不确定，不触发状态变化）。"""
+    if _wininet is not None:
+        flags = wintypes.DWORD(0)
+        try:
+            if not _wininet.InternetGetConnectedState(ctypes.byref(flags), 0):
+                return False
+        except Exception:
+            pass  # API 不可用就只看 DNS
+    servers = getattr(cfg, 'ntp_servers', None) if cfg is not None else None
+    if not servers:
+        servers = ntp_sync.DEFAULT_NTP_SERVERS
+    host = servers[0] if servers else None
+    if not host:
+        return None
+    return _dns_reachable(host)
+
+
+# ---------------------------------------------------------------------------
 # 日志与配置
 # ---------------------------------------------------------------------------
 def _setup_service_logging(console=False):
@@ -183,6 +261,9 @@ def _log_files(backups=None):
 
 def _load_ini():
     cfg = {'interval': DEFAULT_INTERVAL, 'max_skew': 7200.0, 'tolerance': 0.5,
+           'boot_retry_interval': DEFAULT_BOOT_RETRY_INTERVAL,
+           'boot_retry_limit': DEFAULT_BOOT_RETRY_LIMIT,
+           'net_check_interval': DEFAULT_NET_CHECK_INTERVAL,
            'log_max_bytes': DEFAULT_LOG_MAX_BYTES,
            'log_backups': DEFAULT_LOG_BACKUPS}
     if os.path.isfile(CONF_PATH):
@@ -194,6 +275,12 @@ def _load_ini():
                 cfg['interval'] = cp.getint('sync', 'interval', fallback=cfg['interval'])
                 cfg['max_skew'] = cp.getfloat('sync', 'max_skew', fallback=cfg['max_skew'])
                 cfg['tolerance'] = cp.getfloat('sync', 'tolerance', fallback=cfg['tolerance'])
+                cfg['boot_retry_interval'] = cp.getfloat(
+                    'sync', 'boot_retry_interval', fallback=cfg['boot_retry_interval'])
+                cfg['boot_retry_limit'] = cp.getint(
+                    'sync', 'boot_retry_limit', fallback=cfg['boot_retry_limit'])
+                cfg['net_check_interval'] = cp.getfloat(
+                    'sync', 'net_check_interval', fallback=cfg['net_check_interval'])
             if cp.has_section('log'):
                 cfg['log_max_bytes'] = cp.getint(
                     'log', 'max_bytes', fallback=cfg['log_max_bytes'])
@@ -205,6 +292,10 @@ def _load_ini():
         cfg['log_max_bytes'] = DEFAULT_LOG_MAX_BYTES
     if cfg['log_backups'] < 0:
         cfg['log_backups'] = DEFAULT_LOG_BACKUPS
+    # 参数兜底：配置文件被人手滑改成 0 / 负数 / 离谱大时不能把服务卡死
+    cfg['boot_retry_interval'] = max(0.1, min(float(cfg['boot_retry_interval']), 3600.0))
+    cfg['boot_retry_limit'] = max(1, min(int(cfg['boot_retry_limit']), 10000))
+    cfg['net_check_interval'] = max(0.5, min(float(cfg['net_check_interval']), 300.0))
     return cfg
 
 
@@ -216,6 +307,9 @@ def _service_cfg():
     cfg.interval = max(60, int(ini['interval']))
     cfg.max_skew = float(ini['max_skew'])
     cfg.tolerance = float(ini['tolerance'])
+    cfg.boot_retry_interval = float(ini['boot_retry_interval'])
+    cfg.boot_retry_limit = int(ini['boot_retry_limit'])
+    cfg.net_check_interval = float(ini['net_check_interval'])
     return cfg
 
 
@@ -258,20 +352,131 @@ def _guard_log_size(log):
             pass
 
 
-def _worker():
+def _run_loop(cfg, log, sync_fn, net_probe_fn=None, clock=None,
+              sleeper=None, guard=None, stop_event=None):
+    """同步调度核心。依赖全部可注入，便于本地用假时钟/假网络快速验证。
+
+    两个阶段：
+      boot   —— 还没成功过，失败后每 boot_interval 秒重试，最多 boot_limit 次
+      steady —— 成功后按 interval 周期同步，同时持续监听网络恢复
+    """
+    stop_event = stop_event or _stop_event
+    clock = clock or time.time
+    sleeper = sleeper or stop_event.wait
+    net_probe_fn = net_probe_fn or network_ready
+    guard = guard or (lambda: None)
+
+    interval = float(cfg.interval)
+    boot_interval = float(getattr(cfg, 'boot_retry_interval',
+                                  DEFAULT_BOOT_RETRY_INTERVAL))
+    boot_limit = int(getattr(cfg, 'boot_retry_limit', DEFAULT_BOOT_RETRY_LIMIT))
+    net_interval = float(getattr(cfg, 'net_check_interval',
+                                 DEFAULT_NET_CHECK_INTERVAL))
+
+    phase = 'boot'
+    boot_attempts = 0
+    next_sync = 0.0
+    next_net_check = 0.0
+    net_up = None
+    last_net_trigger = -1e12
+    last_sync_failed = False
+
+    while not stop_event.is_set():
+        now = clock()
+
+        # ---- 网络状态监测：两个阶段都开着 ----
+        by_network = False
+        if now >= next_net_check:
+            next_net_check = now + net_interval
+            try:
+                up = net_probe_fn(cfg)
+            except Exception as exc:
+                log.debug('network probe error: %s', exc)
+                up = None
+            if up is not None:
+                recovered = (net_up is False and up is True)
+                # DNS 一直通但 NTP 曾失败的情况，也算「网络侧恢复了」
+                needs_retry = (phase == 'steady' and last_sync_failed and up is True)
+                if ((recovered or needs_retry)
+                        and now - last_net_trigger >= NET_RECOVERY_COOLDOWN):
+                    by_network = True
+                    last_net_trigger = now
+                    log.info('network is available (previous=%s), '
+                             'triggering an extra sync',
+                             'down' if net_up is False else 'unsynced')
+                net_up = up
+
+        if not by_network and now < next_sync:
+            # 用小步睡眠代替一次长 sleep，网络探测和停止信号才能及时响应
+            sleeper(min(0.5, max(0.01, min(next_sync, next_net_check) - now)))
+            continue
+
+        guard()
+        try:
+            # boot 阶段允许大跨度修正（CMOS 掉电可能差好几年）；
+            # 一旦成功就关掉 force，运行期不发生大跳变。
+            result = sync_fn(cfg, write=True, force=(phase == 'boot'))
+        except Exception as exc:
+            last_sync_failed = True
+            if phase == 'boot':
+                boot_attempts += 1
+                log.warning('boot sync attempt %d/%d failed (%s: %s); retry in %.1f s',
+                            boot_attempts, boot_limit,
+                            type(exc).__name__, exc, boot_interval)
+                if boot_attempts >= boot_limit:
+                    log.warning('boot retries exhausted (%d x %.1fs); '
+                                'switching to %ds interval mode, '
+                                'network watch stays on',
+                                boot_limit, boot_interval, interval)
+                    phase = 'steady'
+                    next_sync = now + interval
+                else:
+                    next_sync = now + boot_interval
+            else:
+                delay = min(interval, max(30.0, boot_interval))
+                log.warning('sync failed (%s: %s); retry in %.1f s',
+                            type(exc).__name__, exc, delay)
+                next_sync = now + delay
+            continue
+
+        last_sync_failed = False
+        phase = 'steady'
+        boot_attempts = 0
+        if result.get('refused') == 'skew':
+            log.error('skew guard refused: offset %+.1f s exceeds %.1f s; '
+                      'run manually with --force if the clock is really that wrong',
+                      result['offset'], cfg.max_skew)
+        elif result.get('write'):
+            w = result['write']
+            log.info('clock synced via %s: offset %+.3f s, residual %+.4f s, '
+                     'now %s', result['mode'], w['applied'], w['residual'],
+                     ntp_sync.beijing_str(w['after']))
+        else:
+            log.info('clock already within %.1f s (%+.3f s via %s), '
+                     'next check in %d s', cfg.tolerance, result['offset'],
+                     result['mode'], cfg.interval)
+        next_sync = now + interval
+
+
+def _worker(sync_fn=None, net_probe_fn=None, clock=None, sleeper=None,
+            guard=None, stop_event=None, cfg=None):
     log = logging.getLogger('ntp_sync')
     if not log.handlers:
         _setup_service_logging()
-    try:
-        cfg = _service_cfg()
-    except Exception as exc:
-        log.error('cannot build config: %s', exc)
-        return
+    if cfg is None:
+        try:
+            cfg = _service_cfg()
+        except Exception as exc:
+            log.error('cannot build config: %s', exc)
+            return
 
     ini = _load_ini()
     log.info('worker started (interval=%ds max_skew=%.0fs tolerance=%.1fs '
+             'boot_retry=%.1fs x %d net_check=%.1fs '
              'log=%s max=%dB backups=%d)',
-             cfg.interval, cfg.max_skew, cfg.tolerance, LOG_PATH,
+             cfg.interval, cfg.max_skew, cfg.tolerance,
+             cfg.boot_retry_interval, cfg.boot_retry_limit,
+             cfg.net_check_interval, LOG_PATH,
              ini['log_max_bytes'], ini['log_backups'])
 
     offset_h, tz_status = ntp_sync.ensure_china_timezone(apply=False)
@@ -281,38 +486,11 @@ def _worker():
         log.warning('system time zone is UTC%+g, expected UTC+8; '
                     'run: python ntpsvc.py set-tz', offset_h)
 
-    delay = 0
-    first = True
-    while not _stop_event.is_set():
-        if delay and _stop_event.wait(delay):
-            break
-        _guard_log_size(log)
-        try:
-            # 开机第一次允许大跨度修正（CMOS 掉电可能差好几年），
-            # 之后进入常规护栏，避免运行期发生大跳变。
-            result = ntp_sync.sync_once(cfg, write=True, force=first)
-            if result.get('refused') == 'skew':
-                log.error('skew guard refused: offset %+.1f s exceeds %.1f s; '
-                          'run manually with --force if the clock is really that wrong',
-                          result['offset'], cfg.max_skew)
-                delay = cfg.interval
-            elif result.get('write'):
-                w = result['write']
-                log.info('clock synced via %s: offset %+.3f s, residual %+.4f s, '
-                         'now %s', result['mode'], w['applied'], w['residual'],
-                         ntp_sync.beijing_str(w['after']))
-                first = False
-                delay = cfg.interval
-            else:
-                log.info('clock already within %.1f s (%+.3f s via %s), '
-                         'next check in %d s', cfg.tolerance, result['offset'],
-                         result['mode'], cfg.interval)
-                first = False
-                delay = cfg.interval
-        except Exception as exc:
-            delay = min(max(delay * 2, 15), 300)
-            log.warning('sync failed (%s: %s); retry in %d s',
-                        type(exc).__name__, exc, delay)
+    _run_loop(cfg, log, sync_fn or ntp_sync.sync_once,
+              net_probe_fn or network_ready, clock or time.time,
+              sleeper or _stop_event.wait,
+              guard or (lambda: _guard_log_size(log)),
+              stop_event or _stop_event)
     log.info('worker stopped')
 
 
@@ -399,12 +577,21 @@ def service_status():
 
 
 def _write_ini(interval, log_max_bytes=DEFAULT_LOG_MAX_BYTES,
-               log_backups=DEFAULT_LOG_BACKUPS):
+               log_backups=DEFAULT_LOG_BACKUPS,
+               boot_retry_interval=DEFAULT_BOOT_RETRY_INTERVAL,
+               boot_retry_limit=DEFAULT_BOOT_RETRY_LIMIT,
+               net_check_interval=DEFAULT_NET_CHECK_INTERVAL):
     with io.open(CONF_PATH, 'w', encoding='utf-8') as f:
         f.write(u'[sync]\n')
         f.write(u'interval = %d\n' % interval)
         f.write(u'max_skew = 7200\n')
         f.write(u'tolerance = 0.5\n')
+        f.write(u'; while the first sync has not succeeded: retry every N seconds\n')
+        f.write(u'boot_retry_interval = %g\n' % boot_retry_interval)
+        f.write(u'; give up dense retries after this many attempts (5 x 60 = 5 min)\n')
+        f.write(u'boot_retry_limit = %d\n' % boot_retry_limit)
+        f.write(u'; watch network availability every N seconds; sync on recovery\n')
+        f.write(u'net_check_interval = %g\n' % net_check_interval)
         f.write(u'\n[log]\n')
         f.write(u'; rotate service.log after max_bytes, keep `backups` old files\n')
         f.write(u'; set max_bytes = 0 to disable rotation\n')
@@ -413,13 +600,17 @@ def _write_ini(interval, log_max_bytes=DEFAULT_LOG_MAX_BYTES,
 
 
 def install(interval=DEFAULT_INTERVAL, log_max_bytes=DEFAULT_LOG_MAX_BYTES,
-            log_backups=DEFAULT_LOG_BACKUPS):
+            log_backups=DEFAULT_LOG_BACKUPS,
+            boot_retry_interval=DEFAULT_BOOT_RETRY_INTERVAL,
+            boot_retry_limit=DEFAULT_BOOT_RETRY_LIMIT,
+            net_check_interval=DEFAULT_NET_CHECK_INTERVAL):
     if not ntp_sync.is_admin():
         raise ntp_sync.PrivilegeError('install requires an elevated prompt')
     if not os.path.isfile(PYTHON_EXE):
         raise RuntimeError('python.exe not found next to ntpsvc.py: %s' % PYTHON_EXE)
 
-    _write_ini(interval, log_max_bytes, log_backups)
+    _write_ini(interval, log_max_bytes, log_backups,
+               boot_retry_interval, boot_retry_limit, net_check_interval)
     binpath = u'"%s" "%s" run' % (PYTHON_EXE, SELF_PY)
 
     scm = _open_scm()
@@ -534,6 +725,9 @@ def print_status():
     print('exit code : %d' % st.dwWin32ExitCode)
     print('log file  : %s' % LOG_PATH)
     ini = _load_ini()
+    print('retry     : boot %.1fs x %d, net check %.1fs' %
+          (ini['boot_retry_interval'], ini['boot_retry_limit'],
+           ini['net_check_interval']))
     if ini['log_max_bytes'] > 0:
         print('log rotate: %d bytes x %d backups' %
               (ini['log_max_bytes'], ini['log_backups']))
@@ -578,6 +772,17 @@ def main(argv=None):
                            help='rotate service.log after N bytes (default 1 MiB, 0 = off)')
     p_install.add_argument('--log-backups', type=int, default=DEFAULT_LOG_BACKUPS,
                            help='rotated service.log files to keep (default 5)')
+    p_install.add_argument('--boot-retry-interval', type=float,
+                           default=DEFAULT_BOOT_RETRY_INTERVAL,
+                           help='retry every N seconds until the first sync succeeds '
+                                '(default 5)')
+    p_install.add_argument('--boot-retry-limit', type=int,
+                           default=DEFAULT_BOOT_RETRY_LIMIT,
+                           help='max dense retries at boot (default 60)')
+    p_install.add_argument('--net-check-interval', type=float,
+                           default=DEFAULT_NET_CHECK_INTERVAL,
+                           help='check network every N seconds and sync on recovery '
+                                '(default 3)')
     sub.add_parser('uninstall', help='stop and delete the service')
     sub.add_parser('start', help='start the service')
     sub.add_parser('stop', help='stop the service')
@@ -589,7 +794,9 @@ def main(argv=None):
 
     try:
         if args.cmd == 'install':
-            install(args.interval, args.log_max_bytes, args.log_backups)
+            install(args.interval, args.log_max_bytes, args.log_backups,
+                    args.boot_retry_interval, args.boot_retry_limit,
+                    args.net_check_interval)
         elif args.cmd == 'uninstall':
             uninstall()
         elif args.cmd == 'start':

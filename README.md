@@ -33,8 +33,8 @@ zc-tools/
 
 | 文件 | 是什么 | 版本 | 体积 | 目标机器 |
 |---|---|---|---|---|
-| [ntp_sync_setup.exe](ntp_sync_setup.exe) | 时间同步**安装包**，装完开机未登录即对时 | 1.2.0 | 7.2 MB | Win7 SP1+ / 32 位 |
-| [ntp_sync_win7_x86_py37.zip](ntp_sync_win7_x86_py37.zip) | 时间同步**绿色包**，自带 Python 3.7.9 x86 | 1.2.0 | 6.4 MB | Win7 SP1+ / 32 位 |
+| [ntp_sync_setup.exe](ntp_sync_setup.exe) | 时间同步**安装包**，装完开机未登录即对时 | 1.3.0 | 7.18 MB | Win7 SP1+ / 32 位 |
+| [ntp_sync_win7_x86_py37.zip](ntp_sync_win7_x86_py37.zip) | 时间同步**绿色包**，自带 Python 3.7.9 x86 | 1.3.0 | 6.37 MB | Win7 SP1+ / 32 位 |
 | [tray_mon_win7_x86.zip](tray_mon_win7_x86.zip) | 任务栏性能监控绿色包，自带 Python 3.7.9 x86 | 1.0.0 | 6.4 MB | Win7 SP1+ / 32 位 |
 
 ### 直链（脚本可直接拉）
@@ -54,8 +54,8 @@ https://gh-proxy.org/https://raw.githubusercontent.com/kuangxing6367/zc-tools/ma
 ### SHA-256
 
 ```
-1f59b26ac3db8d5c5550db8ca36f82d2aacb29a82f0de4f27fc46b53735853e0  ntp_sync_setup.exe
-542766a730f1cea54ddf06541116fe85cf584aa21977a3ccebc9549ea0d0190c  ntp_sync_win7_x86_py37.zip
+9ef2900d443ea44512cbbe0a4d6ef2d17b9659601949ee913606f9bb5ebc8857  ntp_sync_setup.exe
+3cb562337f2d9af856b5fc6c16c4f4ab43b5c82997814e93e9f2282cb2f09747  ntp_sync_win7_x86_py37.zip
 850095762ff749a0183a1ab0b073141d243ad1da8df2518b25297d030dd8088a  tray_mon_win7_x86.zip
 ```
 
@@ -69,6 +69,10 @@ Windows 上校验：`certutil -hashfile 文件名 SHA256`
 
 双击 → 下一步 → 装完自动注册成 Windows 服务，**开机不等登录就对时**，
 时间标准锁在中国标准时间 UTC+8。日志按大小轮转（默认 1 MiB × 5）。
+
+针对「网络比服务晚启动」做了两级回退：开机首次成功前失败后每 **5 秒**重试、
+最多 **60 次**；全程每 3 秒探测网络，网一恢复就立刻补一次同步，不用等 30 分钟周期。
+三个参数都能在 `service.ini` 里改。
 
 静默安装：
 
